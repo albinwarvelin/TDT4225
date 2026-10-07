@@ -1,0 +1,5 @@
+AGENTS.md
+.venv/
+__pycache__/
+.env
+Assignment_2/porto/
