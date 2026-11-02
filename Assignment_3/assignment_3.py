@@ -12,7 +12,7 @@ from time import perf_counter
 
 def describe_structure(value) -> str:
     """Show field names and types, without printing the actual data values."""
-    if isinstance(value, dict):
+    if isinstance(value, dict): 
         fields = []
         for key, item in value.items():
             fields.append(f"{key}: {describe_structure(item)}")
@@ -467,6 +467,407 @@ def part1Populate() -> None:
 
 
 
+def part2Question1() -> list:
+    """Find the ten directors with the highest exact median movie revenue."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        pipeline = [
+            # Count each original film, excluding preserved duplicate versions.
+            {"$match": {"duplicate_of": {"$exists": False}}},
+            # Make one temporary document per crew member; keep directors only.
+            {"$unwind": "$crew"},
+            {"$match": {"crew.job": "Director"}},
+            # Count a director only once per film, even with repeated credits.
+            {"$group": {
+                "_id": {"director": "$crew.id", "movie": "$_id"},
+                "name": {"$first": "$crew.name"},
+                "revenue": {"$first": "$revenue"},
+                "vote_average": {"$first": "$vote_average"},
+            }},
+            # Combine those films into one result per director.
+            {"$group": {
+                "_id": "$_id.director",
+                "director": {"$first": "$name"},
+                "movie_count": {"$sum": 1},
+                "revenues": {"$push": "$revenue"},
+                "mean_vote_average": {"$avg": "$vote_average"},
+            }},
+            {"$match": {"movie_count": {"$gte": 5}}},
+        ]
+        directors = list(connection.db.movies.aggregate(pipeline))
+        
+        print("Top 10 directors with at least 5 original films based on median revenue.")
+        
+        # Calculate exact medians before sorting and taking the top ten.
+        for director in directors:
+            revenues = director.pop("revenues")
+            director["median_revenue"] = median(revenues)
+        directors.sort(key=lambda director: (-director["median_revenue"], director["_id"]))
+        results = directors[:10]
+        pprint(results, sort_dicts=False)
+        return results
+    finally:
+        connection.close_connection()
+
+def part2Question2() -> list:
+    """List the top ten actor pairs sharing at least three original films."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        pipeline = [
+            # Keep original films and only the fields needed for this question.
+            {"$match": {"duplicate_of": {"$exists": False}}},
+            {"$project": {"cast.id": 1, "cast.name": 1, "vote_average": 1}},
+            # Two copies let us compare each actor with their co-stars.
+            {"$set": {"cast2": "$cast"}},
+            {"$unwind": "$cast"},
+            {"$unwind": "$cast2"},
+            # Keep A-B once; exclude B-A and actors paired with themselves.
+            {"$match": {"$expr": {"$lt": ["$cast.id", "$cast2.id"]}}},
+            # An actor can have several roles: count each pair once per film.
+            {"$group": {
+                "_id": {"movie": "$_id", "actor1": "$cast.id", "actor2": "$cast2.id"},
+                "actor1": {"$first": "$cast.name"},
+                "actor2": {"$first": "$cast2.name"},
+                "vote_average": {"$first": "$vote_average"},
+            }},
+            # Combine films for the same pair and calculate their statistics.
+            {"$group": {
+                "_id": {"actor1": "$_id.actor1", "actor2": "$_id.actor2"},
+                "actor1": {"$first": "$actor1"},
+                "actor2": {"$first": "$actor2"},
+                "co_appearances": {"$sum": 1},
+                "mean_vote_average": {"$avg": "$vote_average"},
+            }},
+            {"$match": {"co_appearances": {"$gte": 3}}},
+            {"$sort": {"co_appearances": -1, "_id.actor1": 1, "_id.actor2": 1}},
+            {"$limit": 10},
+        ]
+        # Pair grouping can be large; allow MongoDB to use temporary disk space.
+        results = list(connection.db.movies.aggregate(pipeline, allowDiskUse=True))
+        print("Top 10 actor pairs with at least 3 original films, sorted by co-appearances.")
+        pprint(results, sort_dicts=False)
+        return results
+    finally:
+        connection.close_connection()
+
+def part2Question3() -> list:
+    """Find the ten actors with the widest genre breadth and at least ten films."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        pipeline = [
+            # Keep original films and expand their cast into separate records.
+            {"$match": {"duplicate_of": {"$exists": False}}},
+            {"$unwind": "$cast"},
+            # Collect distinct films and their genre lists for each actor ID.
+            {"$group": {
+                "_id": "$cast.id",
+                "actor": {"$first": "$cast.name"},
+                "movie_ids": {"$addToSet": "$_id"},
+                "genre_lists": {"$addToSet": "$genres.name"},
+            }},
+        ]
+
+        results = []
+        for actor in connection.db.movies.aggregate(pipeline, allowDiskUse=True):
+            movie_count = len(actor["movie_ids"])
+            if movie_count < 10:
+                continue
+
+            # A set counts each genre once, even across many different films.
+            genres = set()
+            for genre_list in actor["genre_lists"]:
+                for genre in genre_list or []:
+                    if genre:
+                        genres.add(genre)
+            results.append({
+                "_id": actor["_id"],
+                "actor": actor["actor"],
+                "movie_count": movie_count,
+                "genre_count": len(genres),
+                "example_genres": sorted(genres)[:5],
+            })
+
+        # Rank by genre breadth; actor ID gives a consistent order for ties.
+        results.sort(key=lambda actor: (-actor["genre_count"], actor["_id"]))
+        results = results[:10]
+        print("Top 10 actors with at least 10 original films, sorted by genre breadth.")
+        pprint(results, sort_dicts=False)
+        return results
+    finally:
+        connection.close_connection()
+
+def part2Question4() -> list:
+    """Find the ten film collections with the highest total revenue."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        pipeline = [
+            # Keep original movies that belong to a named film collection.
+            {"$match": {
+                "duplicate_of": {"$exists": False},
+                "belongs_to_collection.name": {"$ne": None},
+            }},
+            {"$group": {
+                "_id": "$belongs_to_collection.id",
+                "collection": {"$first": "$belongs_to_collection.name"},
+                "movie_count": {"$sum": 1},
+                "total_revenue": {"$sum": "$revenue"},
+                "vote_averages": {"$push": "$vote_average"},
+                "earliest_release": {"$min": "$release_date"},
+                "latest_release": {"$max": "$release_date"},
+            }},
+            {"$match": {"movie_count": {"$gte": 3}}},
+            {"$sort": {"total_revenue": -1, "_id": 1}},
+            {"$limit": 10},
+        ]
+        results = list(connection.db.movies.aggregate(pipeline))
+
+        for collection in results:
+            votes = collection.pop("vote_averages")
+            collection["median_vote_average"] = median(votes)
+            for field in ["earliest_release", "latest_release"]:
+                if collection[field] is not None:
+                    collection[field] = collection[field].strftime("%Y-%m-%d")
+
+        print("Top 10 collections with at least 3 original films, sorted by total revenue.")
+        pprint(results, sort_dicts=False)
+        return results
+    finally:
+        connection.close_connection()
+
+def part2Question5() -> list:
+    """Report median runtime and movie count by decade and primary genre."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        pipeline = [
+            # A movie needs a date and at least one genre to assign its group.
+            {"$match": {
+                "duplicate_of": {"$exists": False},
+                "release_date": {"$ne": None},
+                "genres.0": {"$exists": True},
+            }},
+            {"$project": {
+                "year": {"$year": "$release_date"},
+                "primary_genre": {"$arrayElemAt": ["$genres.name", 0]},
+                "runtime": 1,
+            }},
+            # Subtract the year's last digit: 1997 - 7 gives the 1990s.
+            {"$group": {
+                "_id": {
+                    "decade": {"$subtract": ["$year", {"$mod": ["$year", 10]}]},
+                    "genre": "$primary_genre",
+                },
+                "movie_count": {"$sum": 1},
+                "runtimes": {"$push": "$runtime"},
+            }},
+        ]
+
+        results = []
+        for group in connection.db.movies.aggregate(pipeline):
+            # Keep zero runtimes. Missing runtimes do not affect the movie count.
+            runtimes = [runtime for runtime in group["runtimes"] if runtime is not None]
+            results.append({
+                "decade": group["_id"]["decade"],
+                "primary_genre": group["_id"]["genre"],
+                "movie_count": group["movie_count"],
+                "median_runtime": median(runtimes) if runtimes else None,
+            })
+
+        # Decade ascending, median descending, with missing medians last.
+        results.sort(key=lambda group: (
+            group["decade"],
+            group["median_runtime"] is None,
+            -(group["median_runtime"] or 0),
+            group["primary_genre"],
+        ))
+        print("Median runtime and movie count by decade and primary genre.")
+        pprint(results, sort_dicts=False)
+        return results
+    finally:
+        connection.close_connection()
+
+
+
+def part2Question6() -> list:
+    """Average each movie's top-five female cast proportion by decade."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        decades = {}
+        movies = connection.db.movies.find(
+            {"duplicate_of": {"$exists": False}, "release_date": {"$ne": None}},
+            {"cast.order": 1, "cast.gender": 1, "release_date": 1})
+        for movie in movies:
+            # Select the five billing positions before ignoring unknown genders.
+            top_cast = sorted(movie.get("cast") or [], key=lambda actor: actor["order"])[:5]
+            known = [actor for actor in top_cast if actor["gender"] in [1, 2]]
+            if not known:
+                continue
+            female_count = sum(1 for actor in known if actor["gender"] == 1)
+            decade = movie["release_date"].year // 10 * 10
+            if decade not in decades:
+                decades[decade] = []
+            decades[decade].append(female_count / len(known))
+
+        results = []
+        for decade, proportions in decades.items():
+            results.append({"decade": decade, "movie_count": len(proportions),
+                            "average_female_proportion": mean(proportions)})
+        results.sort(key=lambda row: (-row["average_female_proportion"], row["decade"]))
+        print("Average female proportion in the top-five cast, by decade.")
+        pprint(results, sort_dicts=False)
+        return results
+    finally:
+        connection.close_connection()
+
+
+def part2Question7() -> list:
+    """Find the highest-rated noir text matches with at least fifty votes."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        # The existing index searches both fields; noir also matches hyphenated neo-noir.
+        movies = connection.db.movies.find({
+            "duplicate_of": {"$exists": False},
+            "$text": {"$search": "noir"},
+            "vote_count": {"$gte": 50},
+        }, {"title": 1, "release_date": 1, "vote_average": 1, "vote_count": 1})
+        movies = movies.sort([("vote_average", -1), ("_id", 1)]).limit(20)
+        results = []
+        for movie in movies:
+            date = movie.pop("release_date", None)
+            movie["year"] = date.year if date else None
+            results.append(movie)
+        print("Top 20 noir or neo-noir text matches with at least 50 votes.")
+        pprint(results, sort_dicts=False)
+        return results
+    finally:
+        connection.close_connection()
+
+
+def part2Question8() -> list:
+    """Rank director-actor pairs with at least three well-voted collaborations."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        pipeline = [
+            {"$match": {"duplicate_of": {"$exists": False}, "vote_count": {"$gte": 100}}},
+            {"$project": {"crew.id": 1, "crew.name": 1, "crew.job": 1,
+                          "cast.id": 1, "cast.name": 1, "vote_average": 1, "revenue": 1}},
+            {"$unwind": "$crew"},
+            {"$match": {"crew.job": "Director"}},
+            {"$unwind": "$cast"},
+            # Repeated roles or credits must not count the same film twice.
+            {"$group": {
+                "_id": {"movie": "$_id", "director": "$crew.id", "actor": "$cast.id"},
+                "director": {"$first": "$crew.name"},
+                "actor": {"$first": "$cast.name"},
+                "vote_average": {"$first": "$vote_average"},
+                "revenue": {"$first": "$revenue"},
+            }},
+            {"$group": {
+                "_id": {"director": "$_id.director", "actor": "$_id.actor"},
+                "director": {"$first": "$director"},
+                "actor": {"$first": "$actor"},
+                "movie_count": {"$sum": 1},
+                "mean_vote_average": {"$avg": "$vote_average"},
+                "mean_revenue": {"$avg": "$revenue"},
+            }},
+            {"$match": {"movie_count": {"$gte": 3}}},
+            {"$sort": {"mean_vote_average": -1, "_id.director": 1, "_id.actor": 1}},
+            {"$limit": 20},
+        ]
+        results = list(connection.db.movies.aggregate(pipeline, allowDiskUse=True))
+        print("Top 20 director-actor pairs; each film has at least 100 votes.")
+        pprint(results, sort_dicts=False)
+        return results
+    finally:
+        connection.close_connection()
+
+
+def part2Question9() -> list:
+    """Count non-English movies with a US production country by language."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        # Company entries have no country field; use the recorded production country.
+        pipeline = [
+            {"$match": {
+                "duplicate_of": {"$exists": False},
+                "original_language": {"$nin": ["en", None, ""]},
+                "production_countries.iso_3166_1": "US",
+            }},
+            {"$group": {"_id": "$original_language", "movie_count": {"$sum": 1},
+                        "example_title": {"$first": "$title"}}},
+            {"$sort": {"movie_count": -1, "_id": 1}},
+            {"$limit": 10},
+        ]
+        results = list(connection.db.movies.aggregate(pipeline))
+        print("Top 10 non-English languages with US production countries.")
+        print("Company origins are unavailable in the supplied company entries.")
+        pprint(results, sort_dicts=False)
+        return results
+    finally:
+        connection.close_connection()
+
+
+def part2Question10() -> dict:
+    """Report user rating counts, population variance and distinct genre counts."""
+    from DbConnector import DbConnector
+
+    connection = DbConnector()
+    try:
+        # Load the small movie-to-genre lookup, rather than joining every rating.
+        movie_genres = {}
+        for movie in connection.db.movies.find(
+                {"duplicate_of": {"$exists": False}}, {"genres": 1}):
+            movie_genres[movie["_id"]] = [genre["name"] for genre in movie.get("genres") or []]
+
+        pipeline = [{"$group": {
+            "_id": "$userId",
+            "rating_count": {"$sum": 1},
+            "rating_stddev": {"$stdDevPop": "$rating"},
+            "movie_ids": {"$addToSet": "$tmdbId"},
+        }}]
+        users = []
+        for user in connection.db.ratings.aggregate(pipeline, allowDiskUse=True):
+            genres = set()
+            for movie_id in user["movie_ids"]:
+                genres.update(movie_genres.get(movie_id, []))
+            users.append({
+                "userId": user["_id"],
+                "rating_count": user["rating_count"],
+                # Population variance is population standard deviation squared.
+                "rating_variance": user["rating_stddev"] ** 2,
+                "genre_count": len(genres),
+            })
+
+        diverse = sorted(users, key=lambda user: (-user["genre_count"], user["userId"]))[:10]
+        eligible = [user for user in users if user["rating_count"] >= 20]
+        variable = sorted(eligible, key=lambda user: (-user["rating_variance"], user["userId"]))[:10]
+        print("Top 10 most genre-diverse users.")
+        pprint(diverse, sort_dicts=False)
+        print("Top 10 highest-variance users with at least 20 ratings.")
+        pprint(variable, sort_dicts=False)
+        return {"most_genre_diverse": diverse, "highest_variance": variable}
+    finally:
+        connection.close_connection()
+
+
+
 def part1EDA() -> None:
     # Load each selected file once. Comment out both lines to skip a dataset.
     file_start = perf_counter()
@@ -498,9 +899,70 @@ def part1EDA() -> None:
     print()
     print(f"Analysis time: {perf_counter() - file_start:.2f} seconds")
 
+def part2Questions():
+    time_start = perf_counter()
+    part2Question1()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
+    time_start = perf_counter()
+    part2Question2()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
+    time_start = perf_counter()
+    part2Question3()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
+    time_start = perf_counter()
+    part2Question4()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
+    time_start = perf_counter()
+    part2Question5()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
+    time_start = perf_counter()
+    part2Question6()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
+    time_start = perf_counter()
+    part2Question7()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
+    time_start = perf_counter()
+    part2Question8()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
+    time_start = perf_counter()
+    part2Question9()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
+    time_start = perf_counter()
+    part2Question10()
+    elapsed_seconds = perf_counter() - time_start
+    print(f"Processing took {elapsed_seconds:.2f} seconds.")
+    print()
+
 
 if __name__ == "__main__":
     total_start = perf_counter()
     part1EDA()
-    part1Populate()  # Full import; enable when ready to populate MongoDB.
-    print("CSV overviews count stored IDs; analyzeMetadata validates metadata IDs separately.")
+    part1Populate()
+    part2Questions()
